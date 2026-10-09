@@ -1,0 +1,895 @@
+{
+  "name": "P2 – Enrichment waterfall (cache → website → Hunter → Apollo → pattern)",
+  "nodes": [
+    {
+      "id": "w1",
+      "name": "Start",
+      "parameters": {},
+      "position": [
+        -200,
+        300
+      ],
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1
+    },
+    {
+      "id": "w0",
+      "name": "Run from outside (webhook)",
+      "parameters": {
+        "httpMethod": "POST",
+        "options": {},
+        "path": "p2-waterfall",
+        "responseMode": "lastNode"
+      },
+      "position": [
+        -200,
+        500
+      ],
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2
+    },
+    {
+      "credentials": {
+        "supabaseApi": {
+          "name": "Supabase gtm-lab"
+        }
+      },
+      "executeOnce": true,
+      "id": "w2",
+      "name": "Get accounts",
+      "notes": "The same 200 benchmark accounts as the Apollo baseline.",
+      "parameters": {
+        "operation": "getAll",
+        "returnAll": true,
+        "tableId": "waterfall_queue"
+      },
+      "position": [
+        20,
+        400
+      ],
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1
+    },
+    {
+      "id": "w3",
+      "name": "Pick accounts",
+      "parameters": {
+        "jsCode": "// Which accounts to run, and under what label. Webhook body can pass {\"limit\": N, \"run_label\": \"...\"}.\nlet body = {};\ntry { body = $('Run from outside (webhook)').first().json.body || {}; } catch (e) {}\nconst limit = Number(body.limit) || null;\nconst run_label = body.run_label || 'waterfall_v1';\nlet rows = $input.all().map(i => ({ ...i.json, run_label }));\nif (limit) rows = rows.slice(0, limit);\nreturn rows.map(json => ({ json }));"
+      },
+      "position": [
+        240,
+        400
+      ],
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2
+    },
+    {
+      "id": "w4",
+      "name": "One at a time",
+      "parameters": {
+        "batchSize": 1,
+        "options": {}
+      },
+      "position": [
+        460,
+        400
+      ],
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3
+    },
+    {
+      "credentials": {
+        "supabaseApi": {
+          "name": "Supabase gtm-lab"
+        }
+      },
+      "id": "w5",
+      "name": "Step 1 · Cache",
+      "notes": "Free + instant: anything we already found that is still fresh (field_ttl).",
+      "parameters": {
+        "authentication": "predefinedCredentialType",
+        "jsonBody": "={{ JSON.stringify({ p_company_key: $json.company_key }) }}",
+        "method": "POST",
+        "nodeCredentialType": "supabaseApi",
+        "options": {},
+        "sendBody": true,
+        "specifyBody": "json",
+        "url": "https://YOUR_PROJECT_REF.supabase.co/rest/v1/rpc/waterfall_cache"
+      },
+      "position": [
+        680,
+        500
+      ],
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2
+    },
+    {
+      "id": "w6",
+      "name": "Start profile",
+      "parameters": {
+        "jsCode": "// STEP 1 result: start this account's \"profile\" from what we already know and is still fresh (field_ttl).\nconst a = $('One at a time').item.json;\nconst c = (typeof $json === 'object' && $json && !Array.isArray($json)) ? $json : {};\nconst known = ['employee_count','industry','linkedin_url','phone','contact_email','contact_name'].filter(k => c[k] != null);\nreturn { json: {\n  company_key: a.company_key, company_name: a.company_name, domain: a.domain, run_label: a.run_label,\n  employee_count: c.employee_count ?? null, industry: c.industry ?? null, linkedin_url: c.linkedin_url ?? null,\n  phone: c.phone ?? null, contact_email: c.contact_email ?? null, contact_name: c.contact_name ?? null,\n  contact_title: null, pattern: null,\n  steps: [{ provider: 'cache', matched: known.length > 0, credits_used: 0,\n            fields: Object.fromEntries(known.map(k => [k, c[k]])), error: null }]\n}};",
+        "mode": "runOnceForEachItem"
+      },
+      "position": [
+        900,
+        500
+      ],
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2
+    },
+    {
+      "id": "w7",
+      "name": "Step 2 · Website",
+      "notes": "Free: home, /about, /contact, /team. Stops if the site blocks us.",
+      "parameters": {
+        "jsCode": "// STEP 2 (free): read the company's own website (home, /about, /contact, /team) for emails, LinkedIn page, phone.\n// Polite: 4 pages max, identifies itself, and stops if the site blocks us (403/429/503) - no bypassing.\nconst p = { ...$json, steps: [...$json.steps] };\nconst ROLE = /^(info|sales|support|hello|contact|admin|office|team|careers|jobs|hr|marketing|billing|accounts|help|enquiries|inquiries|noreply|no-reply|press|partners|founders)@/i;\nconst needEmail = !p.contact_email || ROLE.test(p.contact_email);\nif (!(needEmail || !p.linkedin_url || !p.phone)) return { json: p };      // nothing missing that a website could give\n\nconst root = String(p.domain).toLowerCase().replace(/^www\\./, '');\nconst found = { emails: new Set(), linkedin: null, phone: null };\nlet pages = 0, error = null;\nfor (const path of ['', '/about', '/contact', '/team']) {\n  try {\n    let html = String(await this.helpers.httpRequest({ method: 'GET', url: 'https://' + root + path, timeout: 8000, json: false,\n      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; gtm-icp-engine research; +https://github.com/knife-co/gtm-icp-engine)' } }) || '');\n    pages++;\n    html = html.replace(/\\\\u00[0-9a-f]{2}/gi, ' ').replace(/%[0-9a-f]{2}/gi, ' ');   // clean escaped characters before looking for emails\n    for (const m of html.matchAll(/[a-z0-9._%+-]+@[a-z0-9.-]+\\.[a-z]{2,}/gi)) {\n      const e = m[0].toLowerCase(), dom = e.split('@')[1];\n      if (/\\.(png|jpe?g|gif|svg|webp)$/.test(e)) continue;\n      if (dom === root || dom.endsWith('.' + root)) found.emails.add(e);\n    }\n    if (!found.linkedin) { const m = html.match(/https?:\\/\\/(?:[a-z]{2,3}\\.)?linkedin\\.com\\/company\\/[A-Za-z0-9_\\-%.]+/i); if (m) found.linkedin = m[0].replace(/[\\/.]+$/, ''); }\n    if (!found.phone) { const m = html.match(/href=[\"']tel:([^\"']+)[\"']/i); if (m) found.phone = decodeURIComponent(m[1]).trim(); }\n  } catch (e) {\n    const code = Number(e.httpCode || e.statusCode || (e.response && e.response.status));\n    if ([403, 429, 503].includes(code)) { error = 'site blocked us (' + code + '), not bypassed'; break; }\n  }\n}\nconst fields = {};\nconst emails = [...found.emails];\nconst personal = emails.find(e => !ROLE.test(e));\nconst pick = personal || emails[0];\nif (pick && needEmail && (!p.contact_email || (personal && ROLE.test(p.contact_email)))) { p.contact_email = pick; fields.contact_email = pick; }\nif (!p.linkedin_url && found.linkedin) { p.linkedin_url = found.linkedin; fields.linkedin_url = found.linkedin; }\nif (!p.phone && found.phone) { p.phone = found.phone; fields.phone = found.phone; }\np.steps.push({ provider: 'website', matched: Object.keys(fields).length > 0, credits_used: 0, fields,\n               error: error || (pages === 0 ? 'site unreachable' : null) });\nreturn { json: p };",
+        "mode": "runOnceForEachItem"
+      },
+      "position": [
+        1120,
+        500
+      ],
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2
+    },
+    {
+      "credentials": {
+        "supabaseApi": {
+          "name": "Supabase gtm-lab"
+        }
+      },
+      "id": "w8",
+      "name": "Hunter: ask breaker + budget",
+      "notes": "'try' or 'skip' (breaker open or 25/month used).",
+      "parameters": {
+        "authentication": "predefinedCredentialType",
+        "jsonBody": "={{ JSON.stringify({ p: 'hunter' }) }}",
+        "method": "POST",
+        "nodeCredentialType": "supabaseApi",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "text"
+            }
+          }
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "url": "https://YOUR_PROJECT_REF.supabase.co/rest/v1/rpc/provider_check"
+      },
+      "position": [
+        1340,
+        500
+      ],
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2
+    },
+    {
+      "id": "w9",
+      "name": "Hunter needed?",
+      "parameters": {
+        "jsCode": "// Only call Hunter if we still have no PERSONAL email, and the breaker/budget says 'try'.\nconst p = $('Step 2 · Website').item.json;\nconst ROLE = /^(info|sales|support|hello|contact|admin|office|team|careers|jobs|hr|marketing|billing|accounts|help|enquiries|inquiries|noreply|no-reply|press|partners|founders)@/i;\nconst answer = String($json.data || '').replace(/\"/g, '');\nconst needEmail = !p.contact_email || ROLE.test(p.contact_email);\nreturn { json: { ...p, _call: needEmail && answer === 'try', _breaker: answer } };",
+        "mode": "runOnceForEachItem"
+      },
+      "position": [
+        1560,
+        500
+      ],
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2
+    },
+    {
+      "id": "w10",
+      "name": "Call Hunter?",
+      "parameters": {
+        "conditions": {
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "w10c",
+              "leftValue": "={{ $json._call }}",
+              "operator": {
+                "operation": "true",
+                "singleValue": true,
+                "type": "boolean"
+              },
+              "rightValue": ""
+            }
+          ],
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "loose",
+            "version": 2
+          }
+        },
+        "options": {}
+      },
+      "position": [
+        1780,
+        500
+      ],
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2
+    },
+    {
+      "disabled": true,
+      "id": "w11",
+      "name": "Step 3 · Hunter domain search",
+      "notes": "Switched OFF until a 'Hunter API' credential (Query Auth, name api_key) is added. ~25 free searches/month.",
+      "onError": "continueRegularOutput",
+      "parameters": {
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpQueryAuth",
+        "method": "GET",
+        "options": {},
+        "url": "=https://api.hunter.io/v2/domain-search?domain={{ $json.domain }}&limit=10"
+      },
+      "position": [
+        2000,
+        400
+      ],
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2
+    },
+    {
+      "id": "w12",
+      "name": "Read Hunter",
+      "parameters": {
+        "jsCode": "// Read Hunter's domain search: best personal email (GTM-ish titles first), the company's email pattern, firmographics.\nconst p = { ...$('Call Hunter?').item.json, steps: [...$('Call Hunter?').item.json.steps] };\nconst r = $json || {};\nconst step = { provider: 'hunter', matched: false, credits_used: 0, fields: {}, error: null };\nlet rec = { p: 'hunter', ok: true, err: null, used: 0 };\nif (r.data && (r.data.domain || r.data.emails)) {\n  const d = r.data; rec.used = 1; step.credits_used = 1;\n  const gtm = t => /(rev ?ops|revenue|sales|marketing|growth|gtm|crm|operations|founder|ceo|head|vp|director)/i.test(t || '') ? 1 : 0;\n  const emails = d.emails || [];\n  const best = emails.filter(e => e.type === 'personal').sort((a, b) => (gtm(b.position) - gtm(a.position)) || ((b.confidence || 0) - (a.confidence || 0)))[0] || emails[0];\n  if (best) {\n    p.contact_email = best.value; p.contact_name = [best.first_name, best.last_name].filter(Boolean).join(' ') || null;\n    p.contact_title = best.position || null;\n    Object.assign(step.fields, { contact_email: p.contact_email, contact_name: p.contact_name, contact_title: p.contact_title });\n  }\n  if (d.pattern) p.pattern = d.pattern;\n  if (!p.industry && d.industry) { p.industry = d.industry; step.fields.industry = d.industry; }\n  if (!p.employee_count && d.headcount) { const n = parseInt(String(d.headcount).match(/\\d+/)?.[0] || '', 10); if (n) { p.employee_count = n; step.fields.employee_count = n; } }\n  if (!p.linkedin_url && d.linkedin) { p.linkedin_url = d.linkedin; step.fields.linkedin_url = d.linkedin; }\n  step.matched = Object.keys(step.fields).length > 0;\n} else if (r.error || r.errors) {\n  rec = { p: 'hunter', ok: false, err: JSON.stringify(r.error || r.errors).slice(0, 300), used: 1 };\n  step.error = rec.err; step.credits_used = 1;\n} else {\n  step.error = 'Hunter not connected yet (node switched off)';\n}\np.steps.push(step); p._record = rec;\nreturn { json: p };",
+        "mode": "runOnceForEachItem"
+      },
+      "position": [
+        2220,
+        400
+      ],
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2
+    },
+    {
+      "credentials": {
+        "supabaseApi": {
+          "name": "Supabase gtm-lab"
+        }
+      },
+      "id": "w13",
+      "name": "Hunter: record result",
+      "parameters": {
+        "authentication": "predefinedCredentialType",
+        "jsonBody": "={{ JSON.stringify({ p: $json._record.p, ok: $json._record.ok, err: $json._record.err, used: $json._record.used }) }}",
+        "method": "POST",
+        "nodeCredentialType": "supabaseApi",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "text"
+            }
+          }
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "url": "https://YOUR_PROJECT_REF.supabase.co/rest/v1/rpc/provider_record_n"
+      },
+      "position": [
+        2440,
+        400
+      ],
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2
+    },
+    {
+      "id": "w14",
+      "name": "Hunter: keep profile",
+      "parameters": {
+        "jsCode": "return { json: $('Read Hunter').item.json };",
+        "mode": "runOnceForEachItem"
+      },
+      "position": [
+        2660,
+        400
+      ],
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2
+    },
+    {
+      "id": "w15",
+      "name": "Profile after Hunter",
+      "parameters": {
+        "jsCode": "// Join point: both branches (called / skipped) continue from here.\nreturn { json: $json };",
+        "mode": "runOnceForEachItem"
+      },
+      "position": [
+        2880,
+        500
+      ],
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2
+    },
+    {
+      "credentials": {
+        "supabaseApi": {
+          "name": "Supabase gtm-lab"
+        }
+      },
+      "id": "w16",
+      "name": "Apollo: ask breaker + budget",
+      "parameters": {
+        "authentication": "predefinedCredentialType",
+        "jsonBody": "={{ JSON.stringify({ p: 'apollo' }) }}",
+        "method": "POST",
+        "nodeCredentialType": "supabaseApi",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "text"
+            }
+          }
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "url": "https://YOUR_PROJECT_REF.supabase.co/rest/v1/rpc/provider_check"
+      },
+      "position": [
+        3100,
+        500
+      ],
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2
+    },
+    {
+      "id": "w17",
+      "name": "Apollo needed?",
+      "parameters": {
+        "jsCode": "// Only call Apollo (costs 1 credit) if size, industry or LinkedIn page is still missing, and the breaker/budget says 'try'.\nconst p = $('Profile after Hunter').item.json;\nconst answer = String($json.data || '').replace(/\"/g, '');\nconst need = !p.employee_count || !p.industry || !p.linkedin_url;\nreturn { json: { ...p, _call: need && answer === 'try', _breaker: answer } };",
+        "mode": "runOnceForEachItem"
+      },
+      "position": [
+        3320,
+        500
+      ],
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2
+    },
+    {
+      "id": "w18",
+      "name": "Call Apollo?",
+      "parameters": {
+        "conditions": {
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "w18c",
+              "leftValue": "={{ $json._call }}",
+              "operator": {
+                "operation": "true",
+                "singleValue": true,
+                "type": "boolean"
+              },
+              "rightValue": ""
+            }
+          ],
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "loose",
+            "version": 2
+          }
+        },
+        "options": {}
+      },
+      "position": [
+        3540,
+        500
+      ],
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2
+    },
+    {
+      "disabled": false,
+      "id": "w19",
+      "name": "Step 4 · Apollo org enrich",
+      "notes": "COMPARISON MODE: replays the answers Apollo gave in today's baseline (counted as 1 credit each, but not charged again). For live use, switch back to GET https://api.apollo.io/api/v1/organizations/enrich?domain=... with the 'Apollo API' credential.",
+      "onError": "continueRegularOutput",
+      "parameters": {
+        "authentication": "predefinedCredentialType",
+        "jsonBody": "={{ JSON.stringify({ p_company_key: $json.company_key }) }}",
+        "method": "POST",
+        "nodeCredentialType": "supabaseApi",
+        "options": {},
+        "sendBody": true,
+        "specifyBody": "json",
+        "url": "https://YOUR_PROJECT_REF.supabase.co/rest/v1/rpc/apollo_replay"
+      },
+      "position": [
+        3760,
+        400
+      ],
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "credentials": {
+        "supabaseApi": {
+          "name": "Supabase gtm-lab"
+        }
+      }
+    },
+    {
+      "id": "w20",
+      "name": "Read Apollo",
+      "parameters": {
+        "jsCode": "const p = { ...$('Call Apollo?').item.json, steps: [...$('Call Apollo?').item.json.steps] };\nconst r = $json || {};\nconst step = { provider: 'apollo', matched: false, credits_used: 0, fields: {}, error: null };\nlet rec = { p: 'apollo', ok: true, err: null, used: 0 };\nif (r.organization) {\n  const o = r.organization; rec.used = r.replayed ? 0 : 1; step.credits_used = 1;   // replayed answers still COUNT as 1 credit, but don't use up the real budget\n  const set = (k, v) => { if (!p[k] && v != null) { p[k] = v; step.fields[k] = v; } };\n  set('employee_count', o.estimated_num_employees);\n  set('industry', o.industry);\n  set('linkedin_url', o.linkedin_url);\n  set('phone', o.primary_phone?.number ?? o.phone ?? null);\n  step.matched = true;\n} else if (r.error || r.errors) {\n  rec = { p: 'apollo', ok: false, err: JSON.stringify(r.error || r.errors).slice(0, 300), used: 0 };\n  step.error = rec.err;\n} else if (r.steps) {\n  step.error = 'Apollo not connected yet (node switched off)';\n} else {\n  step.error = 'no match';                       // Apollo answered but did not know this company: 0 credits\n}\np.steps.push(step); p._record = rec;\nreturn { json: p };",
+        "mode": "runOnceForEachItem"
+      },
+      "position": [
+        3980,
+        400
+      ],
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2
+    },
+    {
+      "credentials": {
+        "supabaseApi": {
+          "name": "Supabase gtm-lab"
+        }
+      },
+      "id": "w21",
+      "name": "Apollo: record result",
+      "parameters": {
+        "authentication": "predefinedCredentialType",
+        "jsonBody": "={{ JSON.stringify({ p: $json._record.p, ok: $json._record.ok, err: $json._record.err, used: $json._record.used }) }}",
+        "method": "POST",
+        "nodeCredentialType": "supabaseApi",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "text"
+            }
+          }
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "url": "https://YOUR_PROJECT_REF.supabase.co/rest/v1/rpc/provider_record_n"
+      },
+      "position": [
+        4200,
+        400
+      ],
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2
+    },
+    {
+      "id": "w22",
+      "name": "Apollo: keep profile",
+      "parameters": {
+        "jsCode": "return { json: $('Read Apollo').item.json };",
+        "mode": "runOnceForEachItem"
+      },
+      "position": [
+        4420,
+        400
+      ],
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2
+    },
+    {
+      "id": "w23",
+      "name": "Profile after Apollo",
+      "parameters": {
+        "jsCode": "// Join point: both branches (called / skipped) continue from here.\nreturn { json: $json };",
+        "mode": "runOnceForEachItem"
+      },
+      "position": [
+        4640,
+        500
+      ],
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2
+    },
+    {
+      "id": "w24",
+      "name": "Step 5 · Pattern guess",
+      "notes": "Free. Needs a person's name; fills in once contact discovery exists.",
+      "parameters": {
+        "jsCode": "// STEP 5 (free): if we know the company's email pattern (from Hunter) and a person's name but no personal email,\n// build the address from the pattern. Always labelled 'unverified' - a guess is not a fact.\nconst p = { ...$json, steps: [...$json.steps] };\nconst ROLE = /^(info|sales|support|hello|contact|admin|office|team|careers|jobs|hr|marketing|billing|accounts|help|enquiries|inquiries|noreply|no-reply|press|partners|founders)@/i;\nconst needEmail = !p.contact_email || ROLE.test(p.contact_email);\nconst [first, ...rest] = String(p.target_name || '').trim().split(/\\s+/);\nconst last = rest.pop();\nif (needEmail && p.pattern && first && last) {\n  const f = first.toLowerCase(), l = last.toLowerCase();\n  const local = p.pattern.replace('{first}', f).replace('{last}', l).replace('{f}', f[0]).replace('{l}', l[0]);\n  p.contact_email = local + '@' + String(p.domain).replace(/^www\\./, '');\n  p.steps.push({ provider: 'pattern', matched: true, credits_used: 0, fields: { contact_email: p.contact_email, contact_name: p.target_name }, error: null });\n}\nreturn { json: p };",
+        "mode": "runOnceForEachItem"
+      },
+      "position": [
+        4860,
+        500
+      ],
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2
+    },
+    {
+      "id": "w25",
+      "name": "Build result rows",
+      "parameters": {
+        "jsCode": "// One row per step that ran, so we can see WHICH source supplied WHAT, and what it cost.\nconst p = $json;\nconst rows = p.steps.map(s => ({\n  run_label: p.run_label, company_key: p.company_key, provider: s.provider, matched: !!s.matched,\n  employee_count: s.fields.employee_count ?? null, industry: s.fields.industry ?? null,\n  linkedin_url: s.fields.linkedin_url ?? null, phone: s.fields.phone ?? null,\n  contact_name: s.fields.contact_name ?? null, contact_title: s.fields.contact_title ?? null,\n  contact_email: s.fields.contact_email ?? null, credits_used: s.credits_used || 0, raw: null, error: s.error ?? null }));\nreturn { json: { rows } };",
+        "mode": "runOnceForEachItem"
+      },
+      "position": [
+        5080,
+        500
+      ],
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2
+    },
+    {
+      "credentials": {
+        "supabaseApi": {
+          "name": "Supabase gtm-lab"
+        }
+      },
+      "id": "w26",
+      "name": "Save waterfall results",
+      "parameters": {
+        "authentication": "predefinedCredentialType",
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Prefer",
+              "value": "resolution=merge-duplicates,return=minimal"
+            }
+          ]
+        },
+        "jsonBody": "={{ JSON.stringify($json.rows) }}",
+        "method": "POST",
+        "nodeCredentialType": "supabaseApi",
+        "options": {},
+        "sendBody": true,
+        "sendHeaders": true,
+        "specifyBody": "json",
+        "url": "https://YOUR_PROJECT_REF.supabase.co/rest/v1/enrichment_results?on_conflict=run_label,company_key,provider"
+      },
+      "position": [
+        5300,
+        500
+      ],
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2
+    },
+    {
+      "credentials": {
+        "supabaseApi": {
+          "name": "Supabase gtm-lab"
+        }
+      },
+      "id": "w27",
+      "name": "Coverage summary",
+      "parameters": {
+        "authentication": "predefinedCredentialType",
+        "method": "GET",
+        "nodeCredentialType": "supabaseApi",
+        "options": {},
+        "url": "https://YOUR_PROJECT_REF.supabase.co/rest/v1/enrichment_coverage?select=*"
+      },
+      "position": [
+        680,
+        200
+      ],
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2
+    }
+  ],
+  "connections": {
+    "Apollo needed?": {
+      "main": [
+        [
+          {
+            "index": 0,
+            "node": "Call Apollo?",
+            "type": "main"
+          }
+        ]
+      ]
+    },
+    "Apollo: ask breaker + budget": {
+      "main": [
+        [
+          {
+            "index": 0,
+            "node": "Apollo needed?",
+            "type": "main"
+          }
+        ]
+      ]
+    },
+    "Apollo: keep profile": {
+      "main": [
+        [
+          {
+            "index": 0,
+            "node": "Profile after Apollo",
+            "type": "main"
+          }
+        ]
+      ]
+    },
+    "Apollo: record result": {
+      "main": [
+        [
+          {
+            "index": 0,
+            "node": "Apollo: keep profile",
+            "type": "main"
+          }
+        ]
+      ]
+    },
+    "Build result rows": {
+      "main": [
+        [
+          {
+            "index": 0,
+            "node": "Save waterfall results",
+            "type": "main"
+          }
+        ]
+      ]
+    },
+    "Call Apollo?": {
+      "main": [
+        [
+          {
+            "index": 0,
+            "node": "Step 4 · Apollo org enrich",
+            "type": "main"
+          }
+        ],
+        [
+          {
+            "index": 0,
+            "node": "Profile after Apollo",
+            "type": "main"
+          }
+        ]
+      ]
+    },
+    "Call Hunter?": {
+      "main": [
+        [
+          {
+            "index": 0,
+            "node": "Step 3 · Hunter domain search",
+            "type": "main"
+          }
+        ],
+        [
+          {
+            "index": 0,
+            "node": "Profile after Hunter",
+            "type": "main"
+          }
+        ]
+      ]
+    },
+    "Get accounts": {
+      "main": [
+        [
+          {
+            "index": 0,
+            "node": "Pick accounts",
+            "type": "main"
+          }
+        ]
+      ]
+    },
+    "Hunter needed?": {
+      "main": [
+        [
+          {
+            "index": 0,
+            "node": "Call Hunter?",
+            "type": "main"
+          }
+        ]
+      ]
+    },
+    "Hunter: ask breaker + budget": {
+      "main": [
+        [
+          {
+            "index": 0,
+            "node": "Hunter needed?",
+            "type": "main"
+          }
+        ]
+      ]
+    },
+    "Hunter: keep profile": {
+      "main": [
+        [
+          {
+            "index": 0,
+            "node": "Profile after Hunter",
+            "type": "main"
+          }
+        ]
+      ]
+    },
+    "Hunter: record result": {
+      "main": [
+        [
+          {
+            "index": 0,
+            "node": "Hunter: keep profile",
+            "type": "main"
+          }
+        ]
+      ]
+    },
+    "One at a time": {
+      "main": [
+        [
+          {
+            "index": 0,
+            "node": "Coverage summary",
+            "type": "main"
+          }
+        ],
+        [
+          {
+            "index": 0,
+            "node": "Step 1 · Cache",
+            "type": "main"
+          }
+        ]
+      ]
+    },
+    "Pick accounts": {
+      "main": [
+        [
+          {
+            "index": 0,
+            "node": "One at a time",
+            "type": "main"
+          }
+        ]
+      ]
+    },
+    "Profile after Apollo": {
+      "main": [
+        [
+          {
+            "index": 0,
+            "node": "Step 5 · Pattern guess",
+            "type": "main"
+          }
+        ]
+      ]
+    },
+    "Profile after Hunter": {
+      "main": [
+        [
+          {
+            "index": 0,
+            "node": "Apollo: ask breaker + budget",
+            "type": "main"
+          }
+        ]
+      ]
+    },
+    "Read Apollo": {
+      "main": [
+        [
+          {
+            "index": 0,
+            "node": "Apollo: record result",
+            "type": "main"
+          }
+        ]
+      ]
+    },
+    "Read Hunter": {
+      "main": [
+        [
+          {
+            "index": 0,
+            "node": "Hunter: record result",
+            "type": "main"
+          }
+        ]
+      ]
+    },
+    "Run from outside (webhook)": {
+      "main": [
+        [
+          {
+            "index": 0,
+            "node": "Get accounts",
+            "type": "main"
+          }
+        ]
+      ]
+    },
+    "Save waterfall results": {
+      "main": [
+        [
+          {
+            "index": 0,
+            "node": "One at a time",
+            "type": "main"
+          }
+        ]
+      ]
+    },
+    "Start": {
+      "main": [
+        [
+          {
+            "index": 0,
+            "node": "Get accounts",
+            "type": "main"
+          }
+        ]
+      ]
+    },
+    "Start profile": {
+      "main": [
+        [
+          {
+            "index": 0,
+            "node": "Step 2 · Website",
+            "type": "main"
+          }
+        ]
+      ]
+    },
+    "Step 1 · Cache": {
+      "main": [
+        [
+          {
+            "index": 0,
+            "node": "Start profile",
+            "type": "main"
+          }
+        ]
+      ]
+    },
+    "Step 2 · Website": {
+      "main": [
+        [
+          {
+            "index": 0,
+            "node": "Hunter: ask breaker + budget",
+            "type": "main"
+          }
+        ]
+      ]
+    },
+    "Step 3 · Hunter domain search": {
+      "main": [
+        [
+          {
+            "index": 0,
+            "node": "Read Hunter",
+            "type": "main"
+          }
+        ]
+      ]
+    },
+    "Step 4 · Apollo org enrich": {
+      "main": [
+        [
+          {
+            "index": 0,
+            "node": "Read Apollo",
+            "type": "main"
+          }
+        ]
+      ]
+    },
+    "Step 5 · Pattern guess": {
+      "main": [
+        [
+          {
+            "index": 0,
+            "node": "Build result rows",
+            "type": "main"
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}

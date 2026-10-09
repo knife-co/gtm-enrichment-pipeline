@@ -1,0 +1,351 @@
+{
+  "name": "P2 – Salesforce sync only (conflict rule)",
+  "nodes": [
+    {
+      "id": "s0",
+      "name": "Run from outside (webhook)",
+      "parameters": {
+        "httpMethod": "POST",
+        "options": {},
+        "path": "p2-sf-sync",
+        "responseMode": "lastNode"
+      },
+      "position": [
+        0,
+        300
+      ],
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2
+    },
+    {
+      "id": "s1",
+      "name": "Start",
+      "parameters": {},
+      "position": [
+        0,
+        100
+      ],
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1
+    },
+    {
+      "id": "s2",
+      "name": "Set run label",
+      "parameters": {
+        "jsCode": "let body = {};\ntry { body = $('Run from outside (webhook)').first().json.body || {}; } catch (e) {}\nreturn [{ json: { run_label: body.run_label || ('sync_' + new Date().toISOString().slice(0, 16).replace(/[-:T]/g, '')), started_at: new Date().toISOString() } }];"
+      },
+      "position": [
+        220,
+        200
+      ],
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2
+    },
+    {
+      "alwaysOutputData": true,
+      "credentials": {
+        "supabaseApi": {
+          "name": "Supabase gtm-lab"
+        }
+      },
+      "executeOnce": true,
+      "id": "s3",
+      "name": "Accounts in Salesforce",
+      "parameters": {
+        "operation": "getAll",
+        "returnAll": true,
+        "tableId": "sf_sync_candidates"
+      },
+      "position": [
+        440,
+        200
+      ],
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1
+    },
+    {
+      "id": "s4",
+      "name": "Build Salesforce query",
+      "parameters": {
+        "jsCode": "const ids = $input.all().map(i => i.json.sf_account_id).filter(Boolean);\nconst list = (ids.length ? ids : ['000000000000000AAA']).map(id => \"'\" + id + \"'\").join(',');\nconst q = 'SELECT Id, NumberOfEmployees, Industry, Phone, Website, Data_Last_Verified__c FROM Account WHERE Id IN (' + list + ')';\nreturn [{ json: { url: 'https://YOUR_INSTANCE.my.salesforce.com/services/data/v62.0/query?q=' + encodeURIComponent(q) } }];"
+      },
+      "position": [
+        660,
+        200
+      ],
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2
+    },
+    {
+      "credentials": {
+        "salesforceJwtApi": {
+          "name": "Salesforce JWT account"
+        }
+      },
+      "id": "s5",
+      "name": "Read Salesforce now",
+      "parameters": {
+        "authentication": "predefinedCredentialType",
+        "method": "GET",
+        "nodeCredentialType": "salesforceJwtApi",
+        "options": {},
+        "url": "={{ $json.url }}"
+      },
+      "position": [
+        880,
+        200
+      ],
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2
+    },
+    {
+      "credentials": {
+        "supabaseApi": {
+          "name": "Supabase gtm-lab"
+        }
+      },
+      "id": "s6",
+      "name": "Apply conflict rule",
+      "parameters": {
+        "authentication": "predefinedCredentialType",
+        "jsonBody": "={{ JSON.stringify({ p_run_label: $('Set run label').first().json.run_label, p_current: $json.records || [] }) }}",
+        "method": "POST",
+        "nodeCredentialType": "supabaseApi",
+        "options": {},
+        "sendBody": true,
+        "specifyBody": "json",
+        "url": "https://YOUR_PROJECT_REF.supabase.co/rest/v1/rpc/sf_sync_plan"
+      },
+      "position": [
+        1100,
+        200
+      ],
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2
+    },
+    {
+      "id": "s7",
+      "name": "Anything to update?",
+      "parameters": {
+        "conditions": {
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "s7c",
+              "leftValue": "={{ ($json.records || []).length > 0 }}",
+              "operator": {
+                "operation": "true",
+                "singleValue": true,
+                "type": "boolean"
+              },
+              "rightValue": ""
+            }
+          ],
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "loose",
+            "version": 2
+          }
+        },
+        "options": {}
+      },
+      "position": [
+        1320,
+        200
+      ],
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2
+    },
+    {
+      "credentials": {
+        "salesforceJwtApi": {
+          "name": "Salesforce JWT account"
+        }
+      },
+      "id": "s8",
+      "name": "Update Salesforce",
+      "parameters": {
+        "authentication": "predefinedCredentialType",
+        "jsonBody": "={{ JSON.stringify({ allOrNone: false, records: $json.records }) }}",
+        "method": "PATCH",
+        "nodeCredentialType": "salesforceJwtApi",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "text"
+            }
+          }
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "url": "https://YOUR_INSTANCE.my.salesforce.com/services/data/v62.0/composite/sobjects"
+      },
+      "position": [
+        1540,
+        100
+      ],
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2
+    },
+    {
+      "credentials": {
+        "supabaseApi": {
+          "name": "Supabase gtm-lab"
+        }
+      },
+      "id": "s9",
+      "name": "Remember what we wrote",
+      "parameters": {
+        "authentication": "predefinedCredentialType",
+        "jsonBody": "={{ JSON.stringify({ p_run_label: $('Set run label').first().json.run_label, p_records: $('Apply conflict rule').first().json.records, p_results: JSON.parse($json.data) }) }}",
+        "method": "POST",
+        "nodeCredentialType": "supabaseApi",
+        "options": {},
+        "sendBody": true,
+        "specifyBody": "json",
+        "url": "https://YOUR_PROJECT_REF.supabase.co/rest/v1/rpc/sf_sync_record"
+      },
+      "position": [
+        1760,
+        100
+      ],
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2
+    },
+    {
+      "id": "s10",
+      "name": "Summary",
+      "parameters": {
+        "jsCode": "const plan = $('Apply conflict rule').first().json;\nreturn [{ json: { run_label: $('Set run label').first().json.run_label, accounts_updated: plan.accounts_to_update, human_values_kept: plan.human_values_kept, held_for_review: plan.held_for_review } }];"
+      },
+      "position": [
+        1980,
+        200
+      ],
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2
+    }
+  ],
+  "connections": {
+    "Accounts in Salesforce": {
+      "main": [
+        [
+          {
+            "index": 0,
+            "node": "Build Salesforce query",
+            "type": "main"
+          }
+        ]
+      ]
+    },
+    "Anything to update?": {
+      "main": [
+        [
+          {
+            "index": 0,
+            "node": "Update Salesforce",
+            "type": "main"
+          }
+        ],
+        [
+          {
+            "index": 0,
+            "node": "Summary",
+            "type": "main"
+          }
+        ]
+      ]
+    },
+    "Apply conflict rule": {
+      "main": [
+        [
+          {
+            "index": 0,
+            "node": "Anything to update?",
+            "type": "main"
+          }
+        ]
+      ]
+    },
+    "Build Salesforce query": {
+      "main": [
+        [
+          {
+            "index": 0,
+            "node": "Read Salesforce now",
+            "type": "main"
+          }
+        ]
+      ]
+    },
+    "Read Salesforce now": {
+      "main": [
+        [
+          {
+            "index": 0,
+            "node": "Apply conflict rule",
+            "type": "main"
+          }
+        ]
+      ]
+    },
+    "Remember what we wrote": {
+      "main": [
+        [
+          {
+            "index": 0,
+            "node": "Summary",
+            "type": "main"
+          }
+        ]
+      ]
+    },
+    "Run from outside (webhook)": {
+      "main": [
+        [
+          {
+            "index": 0,
+            "node": "Set run label",
+            "type": "main"
+          }
+        ]
+      ]
+    },
+    "Set run label": {
+      "main": [
+        [
+          {
+            "index": 0,
+            "node": "Accounts in Salesforce",
+            "type": "main"
+          }
+        ]
+      ]
+    },
+    "Start": {
+      "main": [
+        [
+          {
+            "index": 0,
+            "node": "Set run label",
+            "type": "main"
+          }
+        ]
+      ]
+    },
+    "Update Salesforce": {
+      "main": [
+        [
+          {
+            "index": 0,
+            "node": "Remember what we wrote",
+            "type": "main"
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}

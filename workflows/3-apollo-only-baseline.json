@@ -1,0 +1,308 @@
+{
+  "name": "P2 – Apollo-only baseline (200 accounts)",
+  "nodes": [
+    {
+      "id": "a1",
+      "name": "Start",
+      "parameters": {},
+      "position": [
+        0,
+        200
+      ],
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1
+    },
+    {
+      "id": "a0",
+      "name": "Run from outside (webhook)",
+      "parameters": {
+        "httpMethod": "POST",
+        "options": {},
+        "path": "p2-apollo-baseline",
+        "responseMode": "lastNode"
+      },
+      "position": [
+        0,
+        400
+      ],
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2
+    },
+    {
+      "credentials": {
+        "supabaseApi": {
+          "name": "Supabase gtm-lab"
+        }
+      },
+      "executeOnce": true,
+      "id": "a2",
+      "name": "Get 200 benchmark accounts",
+      "parameters": {
+        "operation": "getAll",
+        "returnAll": true,
+        "tableId": "p2_benchmark_ranked"
+      },
+      "position": [
+        220,
+        300
+      ],
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "notes": "Ordered best ICP score first, so a limit of N always picks the same N companies."
+    },
+    {
+      "id": "a3",
+      "name": "Make batches of 10",
+      "parameters": {
+        "jsCode": "// Group the 200 benchmark accounts into batches of 10 (Apollo bulk enrich takes up to 10).\n// If started from the webhook with {\"limit\": N}, only N accounts are used (for a cheap test).\nlet limit = null;\ntry { limit = Number($('Run from outside (webhook)').first().json.body?.limit) || null; } catch (e) {}\nlet accts = $input.all().map(i => i.json);\nif (limit) accts = accts.slice(0, limit);\nconst out = [];\nfor (let s = 0; s < accts.length; s += 10) {\n  const chunk = accts.slice(s, s + 10);\n  const qs = chunk.map(a => 'domains[]=' + encodeURIComponent(a.domain)).join('&');\n  out.push({ json: { url: 'https://api.apollo.io/api/v1/organizations/bulk_enrich?' + qs,\n                     accounts: chunk.map(a => ({ company_key: a.company_key, domain: a.domain })) } });\n}\nreturn out;"
+      },
+      "position": [
+        440,
+        300
+      ],
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2
+    },
+    {
+      "id": "a4",
+      "maxTries": 3,
+      "name": "Apollo bulk enrich",
+      "notes": "1 credit per company found, 0 if not found. 1 call every 2s keeps us under the free plan's 50/min.",
+      "onError": "continueErrorOutput",
+      "parameters": {
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Cache-Control",
+              "value": "no-cache"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "method": "POST",
+        "options": {
+          "batching": {
+            "batch": {
+              "batchInterval": 2000,
+              "batchSize": 1
+            }
+          }
+        },
+        "sendHeaders": true,
+        "url": "={{ $json.url }}"
+      },
+      "position": [
+        660,
+        300
+      ],
+      "retryOnFail": true,
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "waitBetweenTries": 5000,
+      "credentials": {
+        "httpHeaderAuth": {
+          "name": "Apollo API"
+        }
+      }
+    },
+    {
+      "id": "a5",
+      "name": "Read Apollo results",
+      "parameters": {
+        "jsCode": "// Match each Apollo organization back to the account we asked about (by domain).\nconst host = u => String(u || '').toLowerCase().replace(/^https?:\\/\\//, '').replace(/^www\\./, '').split('/')[0];\nconst batches = $('Make batches of 10').all();\nconst rows = [];\n$input.all().forEach((item, idx) => {\n  const b = batches[item.pairedItem?.item ?? idx].json;\n  const orgs = (item.json.organizations || []).filter(Boolean);\n  const byDomain = {};\n  for (const o of orgs) { for (const d of [o.primary_domain, host(o.website_url)]) if (d) byDomain[host(d)] = o; }\n  for (const a of b.accounts) {\n    const o = byDomain[host(a.domain)];\n    rows.push({\n      run_label: 'apollo_baseline', company_key: a.company_key, provider: 'apollo',\n      matched: !!o,\n      employee_count: o?.estimated_num_employees ?? null,\n      industry: o?.industry ?? null,\n      linkedin_url: o?.linkedin_url ?? null,\n      phone: o?.primary_phone?.number ?? o?.phone ?? o?.sanitized_phone ?? null,\n      hq_country: o?.country ?? null,\n      founded_year: o?.founded_year ?? null,\n      credits_used: o ? 1 : 0,          // Apollo: 1 credit per organization returned, 0 for no match\n      raw: o ? { id: o.id, name: o.name, primary_domain: o.primary_domain } : null,\n      error: null,\n    });\n  }\n});\nreturn [{ json: { rows } }];"
+      },
+      "position": [
+        880,
+        280
+      ],
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2
+    },
+    {
+      "credentials": {
+        "supabaseApi": {
+          "name": "Supabase gtm-lab"
+        }
+      },
+      "id": "a6",
+      "name": "Save to enrichment_results",
+      "parameters": {
+        "authentication": "predefinedCredentialType",
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Prefer",
+              "value": "resolution=merge-duplicates,return=minimal"
+            }
+          ]
+        },
+        "jsonBody": "={{ JSON.stringify($json.rows) }}",
+        "method": "POST",
+        "nodeCredentialType": "supabaseApi",
+        "options": {},
+        "sendBody": true,
+        "sendHeaders": true,
+        "specifyBody": "json",
+        "url": "https://YOUR_PROJECT_REF.supabase.co/rest/v1/enrichment_results?on_conflict=run_label,company_key,provider"
+      },
+      "position": [
+        1100,
+        280
+      ],
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2
+    },
+    {
+      "id": "a7",
+      "name": "Summary",
+      "parameters": {
+        "jsCode": "const rows = $('Read Apollo results').first().json.rows;\nconst n = rows.length, m = rows.filter(r => r.matched).length;\nconst pct = k => n ? Math.round(100 * rows.filter(r => r[k] != null).length / n) + '%' : '0%';\nreturn [{ json: { accounts: n, matched: m, match_rate: n ? Math.round(100 * m / n) + '%' : '0%',\n  size: pct('employee_count'), industry: pct('industry'), linkedin: pct('linkedin_url'), phone: pct('phone'),\n  credits_used_estimate: rows.reduce((s, r) => s + r.credits_used, 0) } }];"
+      },
+      "position": [
+        1320,
+        280
+      ],
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2
+    },
+    {
+      "id": "a8",
+      "name": "Format Apollo error",
+      "parameters": {
+        "jsCode": "const b = $('Make batches of 10').item.json;\nreturn { json: { node: 'Apollo bulk enrich', provider: 'apollo',\n  error: String($json.error?.message || $json.error || 'unknown').slice(0, 500),\n  payload: { accounts: b.accounts } } };",
+        "mode": "runOnceForEachItem"
+      },
+      "position": [
+        880,
+        480
+      ],
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2
+    },
+    {
+      "credentials": {
+        "supabaseApi": {
+          "name": "Supabase gtm-lab"
+        }
+      },
+      "id": "a9",
+      "name": "Save to dead_letter",
+      "parameters": {
+        "dataToSend": "autoMapInputData",
+        "operation": "create",
+        "tableId": "dead_letter"
+      },
+      "position": [
+        1100,
+        480
+      ],
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1
+    }
+  ],
+  "connections": {
+    "Apollo bulk enrich": {
+      "main": [
+        [
+          {
+            "index": 0,
+            "node": "Read Apollo results",
+            "type": "main"
+          }
+        ],
+        [
+          {
+            "index": 0,
+            "node": "Format Apollo error",
+            "type": "main"
+          }
+        ]
+      ]
+    },
+    "Format Apollo error": {
+      "main": [
+        [
+          {
+            "index": 0,
+            "node": "Save to dead_letter",
+            "type": "main"
+          }
+        ]
+      ]
+    },
+    "Get 200 benchmark accounts": {
+      "main": [
+        [
+          {
+            "index": 0,
+            "node": "Make batches of 10",
+            "type": "main"
+          }
+        ]
+      ]
+    },
+    "Make batches of 10": {
+      "main": [
+        [
+          {
+            "index": 0,
+            "node": "Apollo bulk enrich",
+            "type": "main"
+          }
+        ]
+      ]
+    },
+    "Read Apollo results": {
+      "main": [
+        [
+          {
+            "index": 0,
+            "node": "Save to enrichment_results",
+            "type": "main"
+          }
+        ]
+      ]
+    },
+    "Run from outside (webhook)": {
+      "main": [
+        [
+          {
+            "index": 0,
+            "node": "Get 200 benchmark accounts",
+            "type": "main"
+          }
+        ]
+      ]
+    },
+    "Save to enrichment_results": {
+      "main": [
+        [
+          {
+            "index": 0,
+            "node": "Summary",
+            "type": "main"
+          }
+        ]
+      ]
+    },
+    "Start": {
+      "main": [
+        [
+          {
+            "index": 0,
+            "node": "Get 200 benchmark accounts",
+            "type": "main"
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}

@@ -1,0 +1,340 @@
+{
+  "name": "P2 – Dead-letter replay (backoff + circuit breaker)",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "371ffd9b-ab3e-4aa3-82ed-1d5377791d16",
+      "name": "Start",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -656,
+        192
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "getAll",
+        "tableId": "dead_letter_replay_queue",
+        "returnAll": true
+      },
+      "id": "3daee4b5-9a11-47e0-b963-9095d9d2ea79",
+      "name": "Get replay queue",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [
+        -448,
+        192
+      ],
+      "credentials": {
+        "supabaseApi": {
+          "name": "Supabase gtm-lab"
+        }
+      },
+      "notes": "View dead_letter_replay_queue: failures whose backoff wait is over."
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "id": "594d73bb-a0ad-483f-a565-f91fb68c97c7",
+      "name": "One at a time",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        -224,
+        192
+      ],
+      "notes": "One by one, so the circuit breaker can trip mid-run."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://YOUR_PROJECT_REF.supabase.co/rest/v1/rpc/provider_check",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "supabaseApi",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ p: $json.provider }) }}",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "text"
+            }
+          }
+        }
+      },
+      "id": "2bb4a6cd-fec8-4827-a04d-00ee4925d349",
+      "name": "Ask circuit breaker",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        0,
+        272
+      ],
+      "credentials": {
+        "supabaseApi": {
+          "name": "Supabase gtm-lab"
+        }
+      },
+      "notes": "Returns try or skip."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ String($json.data) }}",
+              "rightValue": "try",
+              "operator": {
+                "type": "string",
+                "operation": "contains"
+              }
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "39b3c2b9-5bfd-4910-af40-d59387dd52e4",
+      "name": "Breaker allows call?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        224,
+        272
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Replay ONE dead-letter item, retrying with exponential backoff + full jitter.\n// Wait before retry n = random number between 0 and min(30s, 1s * 2^n).\nconst dl = $('One at a time').item.json;\nconst p = dl.payload || {};\nconst MAX_TRIES = 4, BASE_MS = 1000, CAP_MS = 30000;\nconst sleep = ms => new Promise(r => setTimeout(r, ms));\nconst backoff = n => Math.floor(Math.random() * Math.min(CAP_MS, BASE_MS * 2 ** n));\n\n// Same strict matching rule as Part 2 (high = domain spells the company name)\nfunction pickDomain(list, name) {\n  const base = s => String(s || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();\n  const clean = s => base(s).replace(/\\(.*\\)/g, '')\n    .replace(/\\b(inc|llc|ltd|limited|gmbh|corp|corporation|co|plc|sa|ag|bv|group|holdings|technologies|technology|labs|hq|the|an|a)\\b/g, '')\n    .replace(/[^a-z0-9]/g, '');\n  const SUFFIX = /(hq|app|ai|io|grp|group|inc|global|team|labs|software|tech)$/;\n  const want = clean(name);\n  const pick = list.find(s => clean(s.name) === want);\n  if (!pick) return { domain: null, domain_confidence: null };\n  const domain = String(pick.domain).toLowerCase().replace(/^www\\./, '');\n  const d = domain.split('.')[0].replace(/[^a-z0-9]/g, '');\n  const dc = d.replace(/^(go|get|try|use|join|hey|my)/, '').replace(SUFFIX, '');\n  const nc = want.replace(SUFFIX, '');\n  return { domain, domain_confidence: (d === want || dc === nc || d === nc || dc === want) ? 'high' : 'review' };\n}\n\n// A row that failed while SAVING already has its data: just hand it back to be saved again.\nif (dl.provider === 'supabase') {\n  return { json: { dl_id: dl.id, provider: dl.provider, ok: true, err: null, tries: 0, row_data: p } };\n}\n\nlet lastErr = null, tries = 0;\nfor (let n = 0; n < MAX_TRIES; n++) {\n  tries++;\n  try {\n    const res = await this.helpers.httpRequest({\n      method: 'GET', json: true, timeout: 15000,\n      url: 'https://autocomplete.clearbit.com/v1/companies/suggest?query=' + encodeURIComponent(p.company_name || ''),\n    });\n    const m = pickDomain(Array.isArray(res) ? res : [], p.company_name);\n    return { json: { dl_id: dl.id, provider: dl.provider, ok: true, err: null, tries,\n      row_data: { company_key: p.company_key, company_name: p.company_name, company_slug: p.company_slug,\n                  domain: m.domain, domain_confidence: m.domain_confidence,\n                  enrich_error: m.domain ? null : 'No confident name match (replay)' } } };\n  } catch (e) {\n    lastErr = String(e.message || e).slice(0, 300);\n    const status = e.httpCode || e.statusCode || (e.response && e.response.status);\n    if (status && Number(status) >= 400 && Number(status) < 500 && Number(status) !== 429) break; // our request is wrong: retrying won't help\n    if (n < MAX_TRIES - 1) await sleep(backoff(n));\n  }\n}\nreturn { json: { dl_id: dl.id, provider: dl.provider, ok: false, err: lastErr, tries, row_data: null } };"
+      },
+      "id": "9822457e-dc63-4fba-890d-e48ffff3c521",
+      "name": "Retry with backoff + jitter",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        448,
+        192
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://YOUR_PROJECT_REF.supabase.co/rest/v1/rpc/provider_record",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "supabaseApi",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ p: $json.provider, ok: $json.ok, err: $json.err }) }}",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "text"
+            }
+          }
+        }
+      },
+      "id": "bb8b54ac-4f55-485d-8f31-0306b398fe89",
+      "name": "Update circuit breaker",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        672,
+        192
+      ],
+      "credentials": {
+        "supabaseApi": {
+          "name": "Supabase gtm-lab"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://YOUR_PROJECT_REF.supabase.co/rest/v1/rpc/replay_result",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "supabaseApi",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ dl_id: $('Retry with backoff + jitter').item.json.dl_id, ok: $('Retry with backoff + jitter').item.json.ok, err: $('Retry with backoff + jitter').item.json.err, row_data: $('Retry with backoff + jitter').item.json.row_data }) }}",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "text"
+            }
+          }
+        }
+      },
+      "id": "0a4d2b62-d930-4aac-884a-e9fd08b787ea",
+      "name": "Save replay result",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        880,
+        192
+      ],
+      "credentials": {
+        "supabaseApi": {
+          "name": "Supabase gtm-lab"
+        }
+      },
+      "notes": "Resolved / retry later (with backoff) / gave up / data error."
+    },
+    {
+      "parameters": {
+        "jsCode": "const r = $('Save replay result').all().map(i => String(i.json.data || '').replace(/\"/g, ''));\nconst skipped = $('Breaker allows call?').all().length - $('Retry with backoff + jitter').all().length;\nconst count = s => r.filter(x => x === s).length;\nreturn [{ json: { replayed: r.length, resolved: count('resolved'), retrying_later: count('retrying'),\n  gave_up: count('gave_up'), not_replayable: count('not_replayable'), skipped_breaker_open: Math.max(skipped, 0) } }];"
+      },
+      "id": "54dbdfec-a869-4651-ade5-4792d71fca12",
+      "name": "Summary",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        0,
+        0
+      ]
+    },
+    {
+      "id": "r0",
+      "name": "Run from outside (webhook)",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        500
+      ],
+      "parameters": {
+        "httpMethod": "POST",
+        "options": {},
+        "path": "p2-dead-letter-replay",
+        "responseMode": "lastNode"
+      }
+    }
+  ],
+  "connections": {
+    "Start": {
+      "main": [
+        [
+          {
+            "node": "Get replay queue",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get replay queue": {
+      "main": [
+        [
+          {
+            "node": "One at a time",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "One at a time": {
+      "main": [
+        [
+          {
+            "node": "Summary",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Ask circuit breaker",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ask circuit breaker": {
+      "main": [
+        [
+          {
+            "node": "Breaker allows call?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Breaker allows call?": {
+      "main": [
+        [
+          {
+            "node": "Retry with backoff + jitter",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "One at a time",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Retry with backoff + jitter": {
+      "main": [
+        [
+          {
+            "node": "Update circuit breaker",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Update circuit breaker": {
+      "main": [
+        [
+          {
+            "node": "Save replay result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save replay result": {
+      "main": [
+        [
+          {
+            "node": "One at a time",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Run from outside (webhook)": {
+      "main": [
+        [
+          {
+            "node": "Get replay queue",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}
