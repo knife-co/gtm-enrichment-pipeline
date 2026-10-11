@@ -11,13 +11,14 @@ Built on a $0 stack: **n8n**, **Supabase (Postgres)**, **Salesforce Developer Ed
 | | Apollo only | Waterfall v1 | Production pipeline |
 |---|---|---|---|
 | Any data found | 91.4% | **97.1%** | 97.1% |
-| Size + industry + LinkedIn ("complete") | 91.4%* | 90.0% | **88.6% verified** |
+| Size + industry + LinkedIn ("complete") | 91.4%* | 90.0% | **88.6%** |
+| ...of which identity confirmed | not checked | not checked | **81.4%** (5 more await a human review) |
 | LinkedIn page | 91.4% | 97.1% | **94.3%** |
 | Phone | 70.0% | 75.7% | 72.9% |
 | Credits spent | 64 | 64 | **0** on a re-run (cache) |
 | Wrong-company data in Salesforce | not checked | not checked | **0** (2 caught and rejected) |
 
-\*Apollo's 91.4% includes 2 companies it matched to **the wrong business** (by domain): a UK snowboard shop and a German energy firm. The production pipeline catches these with identity checks, so its lower "complete" number is the honest one.
+\*Apollo's 91.4% includes 2 companies it matched to **the wrong business** (by domain): a UK snowboard shop and a German energy firm. The production pipeline catches these with identity checks, so its lower "complete" number is the honest one. Of its 62 complete accounts, 57 have a confirmed identity; the other 5 are held out of Salesforce until a person reviews them.
 
 **First production run (90 accounts, 11 min):** 70 enriched, 14 partial, 6 unenriched (each with a written reason). 65 stopped at the free cache tier. 10 Apollo credits used, then the budget guard stopped at exactly 75/75. 50 Salesforce fields written, 0 failures, **0 human edits overwritten**.
 
